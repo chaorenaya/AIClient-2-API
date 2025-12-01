@@ -7,8 +7,21 @@ import { ProviderStrategy } from '../provider-strategy.js';
 class GeminiStrategy extends ProviderStrategy {
     extractModelAndStreamInfo(req, requestBody) {
         const requestUrl = new URL(req.url, `http://${req.headers.host}`);
-        const urlPattern = new RegExp(`/v1beta/models/(.+?):(${API_ACTIONS.GENERATE_CONTENT}|${API_ACTIONS.STREAM_GENERATE_CONTENT})`);
-        const urlMatch = requestUrl.pathname.match(urlPattern);
+        // 支持两种 URL 格式：
+        // 1. /v1beta/models/{model}:generateContent (标准 Gemini 格式)
+        // 2. /v1/{model}:generateContent (兼容 claude-code-router)
+        const urlPatternV1Beta = new RegExp(`/v1beta/models/(.+?):(${API_ACTIONS.GENERATE_CONTENT}|${API_ACTIONS.STREAM_GENERATE_CONTENT})`);
+        const urlPatternV1 = new RegExp(`/v1/(.+?):(${API_ACTIONS.GENERATE_CONTENT}|${API_ACTIONS.STREAM_GENERATE_CONTENT})`);
+        
+        let urlMatch = requestUrl.pathname.match(urlPatternV1Beta);
+        if (!urlMatch) {
+            urlMatch = requestUrl.pathname.match(urlPatternV1);
+        }
+        
+        if (!urlMatch) {
+            throw new Error(`Invalid Gemini URL format: ${requestUrl.pathname}`);
+        }
+        
         const [, urlmodel, action] = urlMatch;
         const model = urlmodel;
         const isStream = action === API_ACTIONS.STREAM_GENERATE_CONTENT;

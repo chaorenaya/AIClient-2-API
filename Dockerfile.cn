@@ -1,0 +1,36 @@
+# 使用国内镜像加速
+FROM docker.m.daocloud.io/library/node:20-alpine
+
+# 设置标签
+LABEL maintainer="AIClient2API Team"
+LABEL description="Docker image for AIClient2API server"
+
+# 设置工作目录
+WORKDIR /app
+
+# 设置 npm 镜像源为淘宝镜像
+RUN npm config set registry https://registry.npmmirror.com
+
+# 复制package.json和package-lock.json（如果存在）
+COPY package*.json ./
+
+# 安装依赖
+RUN npm install 
+
+# 复制源代码
+COPY . .
+
+USER root
+
+# 创建目录用于存储日志和系统提示文件
+RUN mkdir -p /app/logs
+
+# 暴露端口
+EXPOSE 3000
+
+# 添加健康检查
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD node healthcheck.js || exit 1
+
+# 设置启动命令
+CMD ["sh", "-c", "node src/api-server.js $ARGS"]

@@ -12,7 +12,6 @@ const KIRO_CONSTANTS = {
     BASE_URL: 'https://codewhisperer.{{region}}.amazonaws.com/generateAssistantResponse',
     AMAZON_Q_URL: 'https://codewhisperer.{{region}}.amazonaws.com/SendMessageStreaming',
     DEFAULT_MODEL_NAME: 'claude-opus-4-5',
-    AXIOS_TIMEOUT: 120000, // 2 minutes timeout
     USER_AGENT: 'KiroIDE',
     CONTENT_TYPE_JSON: 'application/json',
     ACCEPT_JSON: 'application/json',
@@ -278,8 +277,10 @@ export class KiroApiService {
         console.log('[Kiro] Initializing Kiro API Service...');
         await this.initializeAuth();
         const macSha256 = await getMacAddressSha256();
+        const requestTimeout = this.config.KIRO_REQUEST_TIMEOUT || KIRO_CONSTANTS.AXIOS_TIMEOUT;
+        console.log(`[Kiro] Request timeout: ${requestTimeout}ms`);
         const axiosConfig = {
-            timeout: KIRO_CONSTANTS.AXIOS_TIMEOUT,
+            timeout: requestTimeout,
             headers: {
                 'Content-Type': KIRO_CONSTANTS.CONTENT_TYPE_JSON,
                 'x-amz-user-agent': `aws-sdk-js/1.0.7 KiroIDE-0.1.25-${macSha256}`,
@@ -498,7 +499,7 @@ async initializeAuth(forceRefresh = false) {
         const conversationId = uuidv4();
         
         let systemPrompt = this.getContentText(inSystemPrompt);
-        const processedMessages = messages;
+        let processedMessages = messages;
 
         if (processedMessages.length === 0) {
             throw new Error('No user messages found');
@@ -506,17 +507,102 @@ async initializeAuth(forceRefresh = false) {
 
         const codewhispererModel = MODEL_MAPPING[model] || MODEL_MAPPING[this.modelName];
         
-        let toolsContext = {};
-        if (tools && Array.isArray(tools) && tools.length > 0) {
-            toolsContext = {
-                tools: tools.map(tool => ({
-                    toolSpecification: {
-                        name: tool.name,
-                        description: tool.description || "",
-                        inputSchema: { json: tool.input_schema || {} }
+        // Kiro API 对请求大小有限制 (约 200KB)
+        // 配置项: KIRO_MAX_TOOLS (默认 12), KIRO_DISABLE_TOOLS (默认 false), KIRO_MAX_HISTORY (默认 15)
+        // KIRO_MAX_REQUEST_SIZE (默认 100000 bytes), KIRO_MAX_MESSAGE_LENGTH (默认 8000 chars)
+        const maxTools = this.config.KIRO_MAX_TOOLS || 12;
+        const disableTools = this.config.KIRO_DISABLE_TOOLS || false;
+        const maxHistory = this.config.KIRO_MAX_HISTORY || 15;
+        const maxRequestSize = this.config.KIRO_MAX_REQUEST_SIZE || 100000; // 100KB
+        const maxMessageLength = this.config.KIRO_MAX_MESSAGE_LENGTH || 8000; // 每条消息最大字符数
+        
+        // 辅助函数：清理系统提示标签（这些标签可能导致 Kiro API 拒绝请求）
+        const cleanSystemTags = (text) => {
+            if (!text || typeof text !== 'string') return text;
+            // 移除 <system-reminder>...</system-reminder> 标签及其内容
+            return text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, '')
+                       .replace(/\[Request interrupted by user\]/gi, '')
+                       .trim();
+        };
+        
+        // 辅助函数：截断消息内容
+        const truncateContent = (content, maxLen) => {
+            if (!content) return content;
+            if (typeof content === 'string') {
+                let cleaned = cleanSystemTags(content);
+                if (cleaned.length > maxLen) {
+                    return cleaned.substring(0, maxLen) + '\n...[内容已截断]';
+                }
+                return cleaned;
+            }
+            if (Array.isArray(content)) {
+                return content.map(part => {
+                    if (part.type === 'text' && part.text) {
+                        let cleaned = cleanSystemTags(part.text);
+                        if (cleaned.length > maxLen) {
+                            return { ...part, text: cleaned.substring(0, maxLen) + '\n...[内容已截断]' };
+                        }
+                        return { ...part, text: cleaned };
                     }
-                }))
-            };
+                    return part;
+                });
+            }
+            return content;
+        };
+        
+        // 限制历史消息数量，保留最近的消息
+        if (processedMessages.length > maxHistory) {
+            const originalLength = processedMessages.length;
+            // 保留最后 maxHistory 条消息
+            processedMessages = processedMessages.slice(-maxHistory);
+            console.log(`[Kiro] History truncated: ${originalLength} -> ${processedMessages.length} (max: ${maxHistory})`);
+        }
+        
+        // 截断每条消息的内容长度
+        processedMessages = processedMessages.map(msg => ({
+            ...msg,
+            content: truncateContent(msg.content, maxMessageLength)
+        }));
+        
+        // 核心工具白名单 - 只保留 Claude Code 必需的工具
+        const coreTools = ['Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash', 'WebFetch', 'WebSearch', 'AskUserQuestion'];
+        
+        let toolsContext = {};
+        if (!disableTools && tools && Array.isArray(tools) && tools.length > 0) {
+            // 优先保留核心工具，然后按描述长度过滤
+            let filteredTools = tools
+                .filter(tool => {
+                    // 优先保留核心工具
+                    if (coreTools.includes(tool.name)) {
+                        return true;
+                    }
+                    // 跳过描述超过 1000 字符的非核心工具
+                    const descLength = (tool.description || '').length;
+                    if (descLength > 1000) {
+                        console.log(`[Kiro] Skipping tool "${tool.name}" due to long description (${descLength} chars)`);
+                        return false;
+                    }
+                    return true;
+                })
+                .slice(0, maxTools);
+            
+            if (filteredTools.length < tools.length) {
+                console.log(`[Kiro] Tools filtered: ${tools.length} -> ${filteredTools.length} (max: ${maxTools})`);
+            }
+            
+            if (filteredTools.length > 0) {
+                toolsContext = {
+                    tools: filteredTools.map(tool => ({
+                        toolSpecification: {
+                            name: tool.name,
+                            description: (tool.description || '').substring(0, 300), // 更激进地截断描述到300字符
+                            inputSchema: { json: tool.input_schema || {} }
+                        }
+                    }))
+                };
+            }
+        } else if (disableTools && tools && tools.length > 0) {
+            console.log(`[Kiro] Tools disabled by config (KIRO_DISABLE_TOOLS=true), skipping ${tools.length} tools`);
         }
 
         const history = [];
@@ -562,13 +648,18 @@ async initializeAuth(forceRefresh = false) {
                     userInputMessage.images = []; // Initialize images array
                     for (const part of message.content) {
                         if (part.type === 'text') {
-                            userInputMessage.content += part.text;
+                            userInputMessage.content += cleanSystemTags(part.text);
                         } else if (part.type === 'tool_result') {
                             if (!userInputMessage.userInputMessageContext.toolResults) {
                                 userInputMessage.userInputMessageContext.toolResults = [];
                             }
+                            // 清理并截断工具结果
+                            let toolResultText = cleanSystemTags(this.getContentText(part.content));
+                            if (toolResultText.length > maxMessageLength) {
+                                toolResultText = toolResultText.substring(0, maxMessageLength) + '\n...[工具结果已截断]';
+                            }
                             userInputMessage.userInputMessageContext.toolResults.push({
-                                content: [{ text: this.getContentText(part.content) }],
+                                content: [{ text: toolResultText }],
                                 status: 'success',
                                 toolUseId: part.tool_use_id
                             });
@@ -582,7 +673,7 @@ async initializeAuth(forceRefresh = false) {
                         }
                     }
                 } else {
-                    userInputMessage.content = this.getContentText(message);
+                    userInputMessage.content = cleanSystemTags(this.getContentText(message));
                 }
                 history.push({ userInputMessage });
             } else if (message.role === 'assistant') {
@@ -619,10 +710,16 @@ async initializeAuth(forceRefresh = false) {
         if (Array.isArray(currentMessage.content)) {
             for (const part of currentMessage.content) {
                 if (part.type === 'text') {
-                    currentContent += part.text;
+                    currentContent += cleanSystemTags(part.text);
                 } else if (part.type === 'tool_result') {
+                    // 清理 tool_result 内容中的系统标签
+                    let toolResultText = cleanSystemTags(this.getContentText(part.content));
+                    // 截断过长的工具结果
+                    if (toolResultText.length > maxMessageLength) {
+                        toolResultText = toolResultText.substring(0, maxMessageLength) + '\n...[工具结果已截断]';
+                    }
                     currentToolResults.push({
-                        content: [{ text: this.getContentText(part.content) }],
+                        content: [{ text: toolResultText }],
                         status: 'success',
                         toolUseId: part.tool_use_id
                     });
@@ -659,25 +756,107 @@ async initializeAuth(forceRefresh = false) {
         };
 
         if (currentMessage.role === 'user') {
-            request.conversationState.currentMessage.userInputMessage = {
+            const userInputMessage = {
                 content: currentContent,
                 modelId: codewhispererModel,
                 origin: KIRO_CONSTANTS.ORIGIN_AI_EDITOR,
-                images: currentImages && currentImages.length > 0 ? currentImages : null, // Add images here
-                userInputMessageContext: {
-                    toolResults: currentToolResults.length > 0 ? currentToolResults : null,
-                    tools: Object.keys(toolsContext).length > 0 ? toolsContext.tools : null
-                }
+                userInputMessageContext: {}
             };
+            // 只添加非空的字段，避免 null 值
+            if (currentImages && currentImages.length > 0) {
+                userInputMessage.images = currentImages;
+            }
+            if (currentToolResults.length > 0) {
+                userInputMessage.userInputMessageContext.toolResults = currentToolResults;
+            }
+            if (Object.keys(toolsContext).length > 0 && toolsContext.tools) {
+                userInputMessage.userInputMessageContext.tools = toolsContext.tools;
+            }
+            // 如果 userInputMessageContext 为空对象，移除它
+            if (Object.keys(userInputMessage.userInputMessageContext).length === 0) {
+                delete userInputMessage.userInputMessageContext;
+            }
+            request.conversationState.currentMessage.userInputMessage = userInputMessage;
         } else if (currentMessage.role === 'assistant') {
-            request.conversationState.currentMessage.assistantResponseMessage = {
-                content: currentContent,
-                toolUses: currentToolUses.length > 0 ? currentToolUses : undefined
+            // Kiro API 要求 currentMessage 必须是 userInputMessage
+            // 如果最后一条消息是 assistant，将其加入 history，然后创建一个 "Continue" 用户消息
+            console.log('[Kiro] Last message is assistant role, converting to user message with "Continue"');
+            history.push({
+                assistantResponseMessage: {
+                    content: currentContent,
+                    toolUses: currentToolUses.length > 0 ? currentToolUses : []
+                }
+            });
+            // 更新 history
+            request.conversationState.history = history;
+            // 创建一个 "Continue" 用户消息作为 currentMessage
+            const continueMessage = {
+                content: 'Continue',
+                modelId: codewhispererModel,
+                origin: KIRO_CONSTANTS.ORIGIN_AI_EDITOR
             };
+            // 只添加非空的 tools
+            if (Object.keys(toolsContext).length > 0 && toolsContext.tools) {
+                continueMessage.userInputMessageContext = {
+                    tools: toolsContext.tools
+                };
+            }
+            request.conversationState.currentMessage.userInputMessage = continueMessage;
         }
 
         if (this.authMethod === KIRO_CONSTANTS.AUTH_METHOD_SOCIAL) {
             request.profileArn = this.profileArn;
+        }
+        
+        // 检查请求大小，如果超过限制则进一步截断
+        let requestJson = JSON.stringify(request);
+        if (requestJson.length > maxRequestSize) {
+            console.warn(`[Kiro] Request size (${requestJson.length} bytes) exceeds limit (${maxRequestSize}), applying aggressive truncation...`);
+            
+            // 策略1: 进一步减少历史消息
+            while (request.conversationState.history.length > 5 && requestJson.length > maxRequestSize) {
+                request.conversationState.history.shift(); // 移除最早的消息
+                requestJson = JSON.stringify(request);
+                console.log(`[Kiro] Reduced history to ${request.conversationState.history.length} messages, size: ${requestJson.length} bytes`);
+            }
+            
+            // 策略2: 截断历史消息中的长内容
+            if (requestJson.length > maxRequestSize) {
+                const shorterMaxLen = 2000; // 更短的截断长度
+                request.conversationState.history = request.conversationState.history.map(item => {
+                    if (item.userInputMessage && item.userInputMessage.content) {
+                        const content = item.userInputMessage.content;
+                        if (typeof content === 'string' && content.length > shorterMaxLen) {
+                            item.userInputMessage.content = content.substring(0, shorterMaxLen) + '\n...[已截断]';
+                        }
+                    }
+                    if (item.assistantResponseMessage && item.assistantResponseMessage.content) {
+                        const content = item.assistantResponseMessage.content;
+                        if (typeof content === 'string' && content.length > shorterMaxLen) {
+                            item.assistantResponseMessage.content = content.substring(0, shorterMaxLen) + '\n...[已截断]';
+                        }
+                    }
+                    return item;
+                });
+                requestJson = JSON.stringify(request);
+                console.log(`[Kiro] After content truncation, size: ${requestJson.length} bytes`);
+            }
+            
+            // 策略3: 移除工具定义
+            if (requestJson.length > maxRequestSize && request.conversationState.currentMessage?.userInputMessage?.userInputMessageContext?.tools) {
+                console.log(`[Kiro] Removing tools to reduce request size`);
+                request.conversationState.currentMessage.userInputMessage.userInputMessageContext.tools = null;
+                requestJson = JSON.stringify(request);
+                console.log(`[Kiro] After removing tools, size: ${requestJson.length} bytes`);
+            }
+            
+            // 策略4: 最后手段 - 只保留最近3条消息
+            if (requestJson.length > maxRequestSize && request.conversationState.history.length > 3) {
+                console.warn(`[Kiro] Emergency truncation: keeping only last 3 messages`);
+                request.conversationState.history = request.conversationState.history.slice(-3);
+                requestJson = JSON.stringify(request);
+                console.log(`[Kiro] Final size: ${requestJson.length} bytes`);
+            }
         }
         
         return request;
@@ -789,6 +968,43 @@ async initializeAuth(forceRefresh = false) {
         const baseDelay = this.config.REQUEST_BASE_DELAY || 1000; // 1 second base delay
 
         const requestData = this.buildCodewhispererRequest(body.messages, model, body.tools, body.system);
+        
+        // 调试日志：打印请求大小和关键信息
+        const requestJson = JSON.stringify(requestData);
+        console.log(`[Kiro] Request size: ${requestJson.length} bytes`);
+        console.log(`[Kiro] Request has tools: ${requestData.conversationState?.currentMessage?.userInputMessage?.userInputMessageContext?.tools ? 'yes' : 'no'}`);
+        console.log(`[Kiro] History length: ${requestData.conversationState?.history?.length || 0}`);
+        
+        // 打印请求结构用于调试
+        const currentMsg = requestData.conversationState?.currentMessage;
+        if (currentMsg?.userInputMessage) {
+            const uim = currentMsg.userInputMessage;
+            console.log(`[Kiro] CurrentMessage: content=${(uim.content || '').substring(0, 100)}..., modelId=${uim.modelId}, origin=${uim.origin}`);
+            console.log(`[Kiro] CurrentMessage context: toolResults=${uim.userInputMessageContext?.toolResults?.length || 0}, tools=${uim.userInputMessageContext?.tools?.length || 0}`);
+            // 打印 toolResults 详情用于调试
+            if (uim.userInputMessageContext?.toolResults) {
+                uim.userInputMessageContext.toolResults.forEach((tr, i) => {
+                    console.log(`[Kiro] ToolResult[${i}]: toolUseId=${tr.toolUseId}, status=${tr.status}, contentLen=${JSON.stringify(tr.content).length}`);
+                });
+            }
+            if (uim.images) {
+                console.log(`[Kiro] CurrentMessage images: ${uim.images.length}`);
+            }
+        }
+        
+        // 如果请求过大，打印警告
+        if (requestJson.length > 50000) {
+            console.warn(`[Kiro] WARNING: Request size (${requestJson.length} bytes) exceeds 50KB, may cause 400 error`);
+        }
+        
+        // 将请求保存到文件用于调试
+        try {
+            const debugPath = `logs/kiro_request_${Date.now()}.json`;
+            await fs.writeFile(debugPath, JSON.stringify(requestData, null, 2));
+            console.log(`[Kiro] Request saved to ${debugPath} for debugging`);
+        } catch (e) {
+            console.log(`[Kiro] Failed to save debug request: ${e.message}`);
+        }
 
         try {
             const token = this.accessToken; // Use the already initialized token
@@ -802,6 +1018,11 @@ async initializeAuth(forceRefresh = false) {
             const response = await this.axiosInstance.post(requestUrl, requestData, { headers });
             return response;
         } catch (error) {
+            // 打印详细的错误响应
+            if (error.response) {
+                console.error(`[Kiro] Error response status: ${error.response.status}`);
+                console.error(`[Kiro] Error response data: ${JSON.stringify(error.response.data || 'no data')}`);
+            }
             if (error.response?.status === 403 && !isRetry) {
                 console.log('[Kiro] Received 403. Attempting token refresh and retrying...');
                 try {
@@ -825,6 +1046,19 @@ async initializeAuth(forceRefresh = false) {
             if (error.response?.status >= 500 && error.response?.status < 600 && retryCount < maxRetries) {
                 const delay = baseDelay * Math.pow(2, retryCount);
                 console.log(`[Kiro] Received ${error.response.status} server error. Retrying in ${delay}ms... (attempt ${retryCount + 1}/${maxRetries})`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+                return this.callApi(method, model, body, isRetry, retryCount + 1);
+            }
+            
+            // Handle network errors (stream aborted, connection reset, etc.)
+            const isNetworkError = error.code === 'ECONNRESET' || 
+                                   error.code === 'ETIMEDOUT' ||
+                                   error.code === 'ECONNABORTED' ||
+                                   error.message?.includes('stream has been aborted') ||
+                                   error.message?.includes('socket hang up');
+            if (isNetworkError && retryCount < maxRetries) {
+                const delay = baseDelay * Math.pow(2, retryCount);
+                console.log(`[Kiro] Network error: ${error.message}. Retrying in ${delay}ms... (attempt ${retryCount + 1}/${maxRetries})`);
                 await new Promise(resolve => setTimeout(resolve, delay));
                 return this.callApi(method, model, body, isRetry, retryCount + 1);
             }

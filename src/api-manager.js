@@ -43,8 +43,16 @@ export async function handleAPIRequests(method, path, req, res, currentConfig, a
             await handleContentGenerationRequest(req, res, apiService, ENDPOINT_TYPE.OPENAI_RESPONSES, currentConfig, promptLogFilename, providerPoolManager, currentConfig.uuid);
             return true;
         }
+        // 支持 /v1beta/models/{model}:generateContent 格式
         const geminiUrlPattern = new RegExp(`/v1beta/models/(.+?):(${API_ACTIONS.GENERATE_CONTENT}|${API_ACTIONS.STREAM_GENERATE_CONTENT})`);
         if (geminiUrlPattern.test(path)) {
+            await handleContentGenerationRequest(req, res, apiService, ENDPOINT_TYPE.GEMINI_CONTENT, currentConfig, promptLogFilename, providerPoolManager, currentConfig.uuid);
+            return true;
+        }
+        // 支持 /v1/{model}:generateContent 格式 (兼容 claude-code-router)
+        const geminiV1UrlPattern = new RegExp(`/v1/(.+?):(${API_ACTIONS.GENERATE_CONTENT}|${API_ACTIONS.STREAM_GENERATE_CONTENT})`);
+        if (geminiV1UrlPattern.test(path)) {
+            console.log(`[API Manager] Matched Gemini v1 format: ${path}`);
             await handleContentGenerationRequest(req, res, apiService, ENDPOINT_TYPE.GEMINI_CONTENT, currentConfig, promptLogFilename, providerPoolManager, currentConfig.uuid);
             return true;
         }

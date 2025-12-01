@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  aiclient2api:
+    build:
+      context: .
+      dockerfile: Dockerfile.cn
+    container_name: aiclient2api
+    restart: always
+    privileged: true
+    ports:
+      - "3000:3000"
+    environment:
+      - ARGS=--api-key 123456 --host 0.0.0.0
+    volumes:
+      # 挂载源代码目录（开发模式，修改后自动生效）
+      - ./src:/app/src
+      # 挂载配置文件
+      - ./config.json:/app/config.json
+      # 挂载日志目录
+      - ./logs:/app/logs
+      # 挂载 configs 目录（包含 Gemini OAuth 凭据）
+      - ./configs:/app/configs
+      # Kiro OAuth 凭据
+      - ~/.aws/sso/cache:/root/.aws/sso/cache
+      # 如果需要使用 Gemini OAuth，取消下面的注释
+      # - ~/.gemini/oauth_creds.json:/root/.gemini/oauth_creds.json
+      # 如果需要使用 Qwen OAuth，取消下面的注释
+      # - ~/.qwen/oauth_creds.json:/root/.qwen/oauth_creds.json
+    healthcheck:
+      test: ["CMD", "node", "healthcheck.js"]
+      interval: 30s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
